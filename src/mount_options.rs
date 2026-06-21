@@ -245,20 +245,25 @@ impl MountOptions {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn build(&self) -> OsString {
-        let mut opts = vec![String::from("-o fsname=ofs")];
+        // macFUSE expects a single `-o` followed by a comma-separated option
+        // list (like the Linux builder), NOT repeated space-separated `-o`
+        // flags. The old form (`-o fsname=ofs -o allow_root`) was passed to the
+        // mount helper as one argument, so every option after the first was
+        // silently dropped — e.g. a caller-supplied `nobrowse` never took effect.
+        let mut opts = vec![String::from("fsname=ofs")];
 
         if self.allow_root {
-            opts.push("-o allow_root".to_string());
+            opts.push("allow_root".to_string());
         }
 
         if self.allow_other {
-            opts.push("-o allow_other".to_string());
+            opts.push("allow_other".to_string());
         }
 
-        let mut options = OsString::from(opts.join(" "));
+        let mut options = OsString::from(format!("-o {}", opts.join(",")));
 
         if let Some(custom_options) = &self.custom_options {
-            options.push(" ");
+            options.push(",");
             options.push(custom_options);
         }
 
