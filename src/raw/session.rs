@@ -129,7 +129,13 @@ impl ResponseSender {
     /// session as before.
     fn handle_send_error(&self, err: IoError) {
         if Self::is_recoverable_reply_error(err.kind()) {
-            warn!("dropping a failed fuse reply, session continues: {}", err);
+            // Expected and harmless under normal load: macOS file browsers
+            // (Finder, Spotlight, open/save panels) constantly crawl the mount
+            // and routinely interrupt their own requests, so a steady stream of
+            // recoverable drops is the norm. Logging each at WARN floods the log
+            // (tens per second). Keep it at debug for diagnostics only — the
+            // drop itself is already handled by continuing the session.
+            debug!("dropping a failed fuse reply, session continues: {}", err);
         } else {
             error!("reply fuse failed {}", err);
             self.send_failed.notify();
