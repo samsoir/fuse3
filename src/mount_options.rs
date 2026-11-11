@@ -22,6 +22,13 @@ pub enum MacFuseBackend {
     FsKit,
     /// FSKit when macFUSE can mount with it, the kernel extension otherwise
     /// (macFUSE missing or too old, extension not enabled, unsupported macOS).
+    ///
+    /// The fallback covers only a failure before FSKit sends its first
+    /// message (FUSE INIT); the reason is logged at `warn`. Once INIT has
+    /// arrived the mount is committed to FSKit: a later failure is returned
+    /// from the mount call as an error, with no retry on the kernel
+    /// extension, because falling back after a partial mount is riskier
+    /// than failing.
     Auto,
 }
 
