@@ -371,16 +371,17 @@ impl ChannelFuseConnection {
         // MFChannelSendMessage is not documented as non-blocking (it is an
         // XPC send to macFUSE's extension), so it runs on the blocking pool
         // like the receive: a burst of 1 MiB read replies must not park the
-        // runtime's workers. The session lends `data` only for this call, so
-        // it is copied into owned buffers for the blocking thread; that copy
-        // is small beside the XPC transfer itself.
+        // runtime's workers. The session lends `bufs` only for this call, so
+        // they are copied into owned buffers for the blocking thread; that
+        // copy is small beside the XPC transfer itself.
         //
-        // The header and the payload must stay separate iovecs: the FSKit
-        // transport reads the first buffer as the structured reply and the
-        // second as its payload, as `MFMessageGetBodyBuffers` lays out a
-        // request. Joining them into one buffer makes every reply with a
-        // body fail with EIO (seen in `tests/macos_fskit.rs`).
-        let owned: Vec<Vec<u8>> = bufs.iter().map(|buf| buf.to_vec()).collect();
+        // The header and the payload must stay separate iovecs, and there
+        // must be no more than two: the FSKit transport reads the first
+        // buffer as the structured reply and the second as its payload, as
+        // `MFMessageGetBodyBuffers` lays out a request. Joining them into one
+        // buffer makes every reply with a body fail with EIO (seen in
+        // `tests/macos_fskit.rs`). `pack_reply` does the layout.
+        let owned = mfmount::pack_reply(bufs);
         let channel = Arc::clone(&self.channel);
         task::spawn_blocking(move || {
             let slices: Vec<IoSlice<'_>> = owned.iter().map(|buf| IoSlice::new(buf)).collect();

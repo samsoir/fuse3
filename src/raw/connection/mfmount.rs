@@ -338,6 +338,28 @@ impl Drop for Released {
     }
 }
 
+/// Lay a reply out as the two buffers `MFChannelSendMessage` expects, owned
+/// so they can cross to a blocking thread.
+///
+/// The FSKit transport reads the first iovec as the `fuse_out_header` and the
+/// second as everything after it, mirroring how `MFMessageGetBodyBuffers`
+/// lays out a request. The session hands over up to three slices (`send3` for
+/// a `create` reply or a `notify_store`, and notifications carry their names
+/// as separate slices), so `bufs[0]` stays the header and `bufs[1..]` are
+/// joined into one payload. A reply with no slices after the header gets no
+/// payload buffer; one whose payload slices are empty still gets one, as
+/// before the vectored-write refactor.
+pub(crate) fn pack_reply(bufs: &[IoSlice<'_>]) -> Vec<Vec<u8>> {
+    let Some((header, rest)) = bufs.split_first() else {
+        return Vec::new();
+    };
+    let mut packed = vec![header.to_vec()];
+    if !rest.is_empty() {
+        packed.push(rest.iter().flat_map(|buf| buf.iter().copied()).collect());
+    }
+    packed
+}
+
 /// Copy the message `parts`, in order, across the destination `bufs`.
 ///
 /// Mirrors what `readv(2)` does with one FUSE message from the device: the
@@ -390,6 +412,41 @@ pub(crate) fn mount_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_reply_keeps_a_header_only_reply_as_one_buffer() {
+        let packed = pack_reply(&[IoSlice::new(b"hdr")]);
+        assert_eq!(packed, vec![b"hdr".to_vec()]);
+    }
+
+    #[test]
+    fn pack_reply_keeps_header_and_payload_as_two_buffers() {
+        let packed = pack_reply(&[IoSlice::new(b"hdr"), IoSlice::new(b"data")]);
+        assert_eq!(packed, vec![b"hdr".to_vec(), b"data".to_vec()]);
+    }
+
+    #[test]
+    fn pack_reply_joins_every_slice_after_the_header_into_one_payload() {
+        // send3: a create reply (entry_out + open_out) or a notify_store.
+        let packed = pack_reply(&[
+            IoSlice::new(b"hdr"),
+            IoSlice::new(b"entry"),
+            IoSlice::new(b"open"),
+        ]);
+        assert_eq!(packed, vec![b"hdr".to_vec(), b"entryopen".to_vec()]);
+    }
+
+    #[test]
+    fn pack_reply_keeps_an_empty_payload_buffer() {
+        // A zero-byte read reply at end of file.
+        let packed = pack_reply(&[IoSlice::new(b"hdr"), IoSlice::new(b"")]);
+        assert_eq!(packed, vec![b"hdr".to_vec(), Vec::new()]);
+    }
+
+    #[test]
+    fn pack_reply_of_nothing_is_nothing() {
+        assert!(pack_reply(&[]).is_empty());
+    }
 
     #[test]
     fn scatter_fills_the_header_then_the_data_buffer() {
