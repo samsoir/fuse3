@@ -1,6 +1,6 @@
 [package]
 name = "fuse3"
-version = "0.9.0"
+version = "0.10.0"
 authors = ["Sherlock Holo <sherlockya@gmail.com>"]
 edition = "2024"
 readme = "README.md"
@@ -53,3 +53,7 @@ targets = [
   "x86_64-unknown-freebsd",
   "x86_64-unknown-linux-gnu",
 ]
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "sync", "time"] }

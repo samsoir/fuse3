@@ -5,6 +5,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
+use std::io::IoSlice;
 use std::io::Result as IoResult;
 use std::num::NonZeroU32;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -157,40 +158,28 @@ impl ResponseSender {
 
     /// send response with only header, no data
     pub(crate) async fn send1(&self, header: &fuse_out_header) {
-        if let Err(err) = self
-            .connection
-            .write_vectored::<_, &[u8]>(header.as_bytes(), None)
-            .await
-            .1
-        {
-            self.handle_send_error(err);
-        }
+        self.send(&[IoSlice::new(header.as_bytes())]).await;
     }
 
     /// send response with header and data
     pub(crate) async fn send2(&self, header: &fuse_out_header, data: &[u8]) {
-        if let Err(err) = self
-            .connection
-            .write_vectored::<_, &[u8]>(header.as_bytes(), Some(data))
-            .await
-            .1
-        {
-            self.handle_send_error(err);
-        }
+        self.send(&[IoSlice::new(header.as_bytes()), IoSlice::new(data)])
+            .await;
     }
 
     /// send response with header and two parts of data.
     pub(crate) async fn send3(&self, header: &fuse_out_header, d1: &[u8], d2: &[u8]) {
-        // TODO: Implement a write_vectored in FuseConnection to avoid this copy
-        let mut data = Vec::with_capacity(d1.len() + d2.len());
-        data.extend_from_slice(d1);
-        data.extend_from_slice(d2);
-        if let Err(err) = self
-            .connection
-            .write_vectored::<_, &[u8]>(header.as_bytes(), Some(&data))
-            .await
-            .1
-        {
+        self.send(&[
+            IoSlice::new(header.as_bytes()),
+            IoSlice::new(d1),
+            IoSlice::new(d2),
+        ])
+        .await;
+    }
+
+    /// Send a response or notification from borrowed buffers in a single write.
+    pub(crate) async fn send(&self, bufs: &[IoSlice<'_>]) {
+        if let Err(err) = self.connection.write_vectored(bufs).await {
             self.handle_send_error(err);
         }
     }
@@ -677,8 +666,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
         let data_ref = &data_buffer[..data_size];
 
-        self.handle_init(request, data_ref, fuse_connection, fs)
-            .await
+        let max_write = self
+            .handle_init(request, data_ref, fuse_connection, fs)
+            .await?;
+        fs.ready(self.get_notify()).await;
+        Ok(max_write)
     }
 
     #[instrument(level = "debug", skip(self, header_buffer, data_buffer), ret)]
@@ -1080,9 +1072,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 };
 
                 if let Err(err) = fuse_connection
-                    .write_vectored::<_, &[u8]>(init_out_header.as_bytes(), None)
+                    .write_vectored(&[IoSlice::new(init_out_header.as_bytes())])
                     .await
-                    .1
                 {
                     error!("write error init out data to /dev/fuse failed {}", err);
                 }
@@ -1290,9 +1281,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 };
 
                 if let Err(err) = fuse_connection
-                    .write_vectored::<_, &[u8]>(init_out_header.as_bytes(), None)
+                    .write_vectored(&[IoSlice::new(init_out_header.as_bytes())])
                     .await
-                    .1
                 {
                     error!("write error init out data to /dev/fuse failed {}", err);
                 }
@@ -1328,9 +1318,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         };
 
         if let Err(err) = fuse_connection
-            .write_vectored(out_header.as_bytes(), Some(init_out.as_bytes()))
+            .write_vectored(&[
+                IoSlice::new(out_header.as_bytes()),
+                IoSlice::new(init_out.as_bytes()),
+            ])
             .await
-            .1
         {
             error!("write init out data to /dev/fuse failed {}", err);
 
@@ -2944,7 +2936,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 let padding_size = get_padding_size(dir_entry_size);
 
-                if entry_data.len() + dir_entry_size > max_size {
+                // the padding is sent too, so it must fit as well
+                if !dir_entry_fits(entry_data.len(), dir_entry_size, max_size) {
                     break;
                 }
 
@@ -3645,7 +3638,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         spawn(debug_span!("fuse_batch_forget"), async move {
             let inodes = forgets
                 .into_iter()
-                .map(|forget_one| forget_one.nodeid)
+                .map(|forget_one| (forget_one.nodeid, forget_one.nlookup))
                 .collect::<Vec<_>>();
 
             debug!("batch_forget unique {} inodes {:?}", request.unique, inodes);
@@ -3789,7 +3782,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 let padding_size = get_padding_size(dir_entry_size);
 
-                if entry_data.len() + dir_entry_size > max_size {
+                // the padding is sent too, so it must fit as well
+                if !dir_entry_fits(entry_data.len(), dir_entry_size, max_size) {
                     break;
                 }
 
@@ -4061,6 +4055,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             resp_sender.send2(&out_header, write_out.as_bytes()).await;
         });
     }
+}
+
+/// Run `fut` in the background on the runtime of the session.
+pub(crate) fn spawn_task<F>(fut: F)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn(debug_span!("fuse3_task"), fut)
 }
 
 #[inline]
