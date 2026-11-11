@@ -57,6 +57,38 @@ impl Filesystem for Hello {
 
     async fn destroy(&self, _req: Request) {}
 
+    // `file-lock` makes these required; CI builds every test with it on.
+    #[cfg(feature = "file-lock")]
+    async fn getlk(
+        &self,
+        _req: Request,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+    ) -> Result<ReplyLock> {
+        Err(libc::ENOSYS.into())
+    }
+
+    #[cfg(feature = "file-lock")]
+    async fn setlk(
+        &self,
+        _req: Request,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+        _block: bool,
+    ) -> Result<()> {
+        Err(libc::ENOSYS.into())
+    }
+
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> Result<ReplyEntry> {
         if parent == 1 && name == "hello.txt" {
             Ok(ReplyEntry {
