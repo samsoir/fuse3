@@ -254,10 +254,26 @@ impl Channel {
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
+        // An empty message may come with a null `iovs`, which
+        // `slice::from_raw_parts` forbids even for a zero length. Report it
+        // as a zero-byte read, as `readv(2)` would; the session rejects any
+        // read shorter than `fuse_in_header`.
+        if count == 0 {
+            return Ok(0);
+        }
+        if iovs.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MFMessageGetBodyBuffers returned no buffers",
+            ));
+        }
         // Safety: MFMessageGetBodyBuffers returns `count` iovecs borrowed from
-        // `message`, which stays alive until `_release` drops.
+        // `message`, which stays alive until `_release` drops, and `iovs` was
+        // checked non-null above.
         let iovs = unsafe { std::slice::from_raw_parts(iovs, count as usize) };
-        let parts = iovs.iter().map(|iov| unsafe {
+        // An empty iovec may also carry a null base, so it is skipped rather
+        // than turned into a slice.
+        let parts = iovs.iter().filter(|iov| iov.iov_len > 0).map(|iov| unsafe {
             std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
         });
         scatter(parts, bufs)
