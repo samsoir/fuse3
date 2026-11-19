@@ -94,11 +94,7 @@ fn load() -> Result<Api, String> {
     unsafe {
         let handle = libc::dlopen(MFMOUNT_PATH.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if handle.is_null() {
-            return Err(format!(
-                "macFUSE MFMount.framework could not be loaded ({}). The FSKit backend needs \
-                 macFUSE {MINIMUM_MACFUSE} or later.",
-                last_dl_error()
-            ));
+            return Err(load_failure_message(&last_dl_error()));
         }
 
         macro_rules! symbol {
@@ -130,6 +126,32 @@ fn load() -> Result<Api, String> {
             channel_interrupt: symbol!("MFChannelInterrupt", InterruptFn),
             mount: symbol!("MFMount", MountFn),
         })
+    }
+}
+
+/// The error for a `dlopen` of MFMount.framework that failed with
+/// `dl_error`, with a hint that matches the cause.
+///
+/// dyld says "not valid for use in process" when the process's code signature
+/// refuses the framework's: under the hardened runtime, library validation
+/// rejects a framework signed by another team ("different Team IDs"), and
+/// macFUSE is signed by its own. Upgrading macFUSE cannot fix that, the
+/// application's signature can, so that case names the entitlement rather
+/// than the macFUSE version. Every other failure (no framework, an older
+/// macFUSE) asks for the minimum version.
+fn load_failure_message(dl_error: &str) -> String {
+    if dl_error.contains("not valid for use in process") {
+        format!(
+            "macFUSE MFMount.framework could not be loaded ({dl_error}). The process's code \
+             signature refuses frameworks signed by other developers (library validation): \
+             sign the application with the com.apple.security.cs.disable-library-validation \
+             entitlement."
+        )
+    } else {
+        format!(
+            "macFUSE MFMount.framework could not be loaded ({dl_error}). The FSKit backend \
+             needs macFUSE {MINIMUM_MACFUSE} or later."
+        )
     }
 }
 
@@ -452,6 +474,37 @@ fn retry_interrupted<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEAM_ID_REFUSAL: &str = "dlopen(/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount, 0x0006): tried: '/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount' (code signature in <5CBC3F8E-9143-32A9-A0A1-B4CE30E9D964> '/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/Versions/A/MFMount' not valid for use in process: mapping process and mapped file (non-platform) have different Team IDs)";
+    const MISSING: &str = "dlopen(/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount, 0x0006): tried: '/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount' (no such file)";
+
+    #[test]
+    fn a_library_validation_refusal_names_the_entitlement() {
+        let message = load_failure_message(TEAM_ID_REFUSAL);
+        assert!(message.contains(TEAM_ID_REFUSAL), "{message}");
+        assert!(message.contains("library validation"), "{message}");
+        assert!(
+            message.contains("com.apple.security.cs.disable-library-validation"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_library_validation_refusal_does_not_blame_the_macfuse_version() {
+        let message = load_failure_message(TEAM_ID_REFUSAL);
+        assert!(!message.contains("or later"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_framework_asks_for_a_newer_macfuse() {
+        let message = load_failure_message(MISSING);
+        assert!(message.contains(MISSING), "{message}");
+        assert!(
+            message.contains(&format!("macFUSE {MINIMUM_MACFUSE} or later")),
+            "{message}"
+        );
+        assert!(!message.contains("library validation"), "{message}");
+    }
 
     #[test]
     fn an_interrupted_call_is_retried_until_it_succeeds() {
