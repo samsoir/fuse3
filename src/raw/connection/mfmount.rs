@@ -241,12 +241,25 @@ impl Channel {
     /// Blocks until a message arrives. Returns the message length, like
     /// `readv(2)` on the FUSE device. A message larger than `bufs` is an
     /// `EIO` error rather than a silent truncation.
+    ///
+    /// An interrupted receive (`EINTR`) is retried. `MFMount.h` fails a
+    /// blocked `MFChannelCopyNextMessage` with `EINTR` when it is interrupted,
+    /// and a signal delivered to the blocked thread does that even when its
+    /// handler was installed with `SA_RESTART`. Returned to the session, the
+    /// `EINTR` ended it as a failed read: a Ctrl-C that landed on this thread
+    /// stopped the server before the application could unmount, leaving the
+    /// volume mounted with nothing serving it. Closing the channel still ends
+    /// a receive, with `ENODEV`.
     pub(crate) fn receive(&self, bufs: &mut [&mut [u8]]) -> io::Result<usize> {
         let api = api()?;
-        let message = unsafe { (api.channel_copy_next_message)(self.raw) };
-        if message.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+        let message = retry_interrupted(|| {
+            let message = unsafe { (api.channel_copy_next_message)(self.raw) };
+            if message.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(message)
+            }
+        })?;
         let _release = Released(message, api.release);
 
         let mut iovs: *const libc::iovec = std::ptr::null();
@@ -297,8 +310,9 @@ impl Channel {
         }
     }
 
-    /// Wake a thread blocked in [`wait_for_message`](Self::wait_for_message)
-    /// or [`receive`](Self::receive).
+    /// Wake a thread blocked in [`wait_for_message`](Self::wait_for_message).
+    /// A [`receive`](Self::receive) retries an interrupt and keeps waiting;
+    /// [`close`](Self::close) is what ends it.
     pub(crate) fn interrupt(&self) {
         if let Ok(api) = api() {
             unsafe { (api.channel_interrupt)(self.raw) };
@@ -425,9 +439,55 @@ pub(crate) fn mount_args(
     ))
 }
 
+/// Run `op` again for as long as it fails with `EINTR`.
+fn retry_interrupted<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match op() {
+            Err(err) if err.raw_os_error() == Some(libc::EINTR) => continue,
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_interrupted_call_is_retried_until_it_succeeds() {
+        let mut calls = 0;
+        let result = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn any_other_error_is_returned_at_once() {
+        let mut calls = 0;
+        let result: io::Result<()> = retry_interrupted(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::ENODEV))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENODEV));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_success_is_returned_without_a_retry() {
+        let mut calls = 0;
+        let result = retry_interrupted(|| {
+            calls += 1;
+            Ok("message")
+        });
+        assert_eq!(result.unwrap(), "message");
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn pack_reply_keeps_a_header_only_reply_as_one_buffer() {
